@@ -1,0 +1,32 @@
+Found 5 segments:
+-------------------------------------------
+Segment Type: 0xfffe
+Segment Size: 16 Bytes
+Segment Data:
+0x0004FFFE 0x00000000 0x00000000 0x1421033E
+-------------------------------------------
+Segment Type: 0xfffa
+Segment Size: 20 Bytes
+Segment Data:
+0x0005FFFA 0x13290000 0x00000000 0x00000000
+0x00000000
+-------------------------------------------
+Segment Type: 0x1329
+Segment Size: 36 Bytes
+Segment Data:
+0x00091329 0x00000000 0x00000000 0x00000000
+0x00000001 0x1111AA00 0x22220503 0x3333BB01
+0x44440703
+-------------------------------------------
+Segment Type: 0x1329
+Segment Size: 36 Bytes
+Segment Data:
+0x00091329 0x00000000 0x00000000 0x00000000
+0x00000000 0x55550603 0x6666CC01 0x7777DD01
+0x88880403
+-------------------------------------------
+Segment Type: 0xfffb
+Segment Size: 4 Bytes
+Segment Data:
+0x0001FFFB
+-------------------------------------------

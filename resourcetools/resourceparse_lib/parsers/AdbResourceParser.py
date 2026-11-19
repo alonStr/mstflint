@@ -205,7 +205,7 @@ class AdbResourceParser(ResourceParser):
         """This method is a recursive method that build the inner fields
         """
         try:
-            if field.condition and not field.condition.evaluate(self._current_bit_array):
+            if field.condition and not field.condition.evaluate(self._current_bit_array, offset_shift):
                 return
         except ResourceParseException as rpe:
             seg.add_parsed_data("Warning:{}".format(cs.WARNING_FAILED_EVAL_CONDITION.format(str(rpe), field_str)))

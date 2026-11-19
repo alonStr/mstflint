@@ -233,7 +233,16 @@ class AdbParser:
         return None
 
     @staticmethod
-    def get_layout_item_by_path(path: str, layout_item):
+    def get_layout_item_by_path(path: str, layout_item, skip_union_parent=False):
+        """This method returns the layout item that path points to, as seen from layout_item.
+
+        skip_union_parent selects the $(parent) rule, because the callers follow different rules,
+        as in the C++ adb_parser:
+        - Conditions pass True: $(parent) of a union member is the node holding the union.
+        - Union selectors keep False: $(parent) is the direct parent, even when it is a union.
+        Checking whether the parent is a union can't replace the flag, since a union selector's
+        direct parent is often a union too.
+        """
         seperator_index = path.find(".")
         root_item = None
         # If There's a parent or segment prefix search path according to the prefix
@@ -241,7 +250,18 @@ class AdbParser:
             prefix = path[:seperator_index]
             if prefix in CONST.PARENT_PREFIX_LIST:
                 root_item = layout_item.parent
-                return root_item.get_child_by_path(path[seperator_index + 1:]) if root_item else None
+                if not root_item:
+                    return None
+                sub_path = path[seperator_index + 1:]
+                if skip_union_parent and root_item.nodeDesc.isUnion and root_item.parent:
+                    # As in the C++ adb_parser, $(parent) of a union member is the node holding the union.
+                    # Resolving it against the union itself is only a fallback, for an old behaviour found in FW
+                    # conditions that point $(parent) at the union. FW should fix those conditions, which saves this
+                    # extra lookup and slightly improves performance.
+                    found_item = root_item.parent.get_child_by_path(sub_path)
+                    if found_item:
+                        return found_item
+                return root_item.get_child_by_path(sub_path)
             elif prefix == CONST.SEGMENT_PREFIX:
                 root_item = layout_item.get_root()
                 return root_item.get_child_by_path(path[seperator_index + 1:]) if root_item else None
@@ -477,19 +497,25 @@ class ConditionVariable:
         self.evaluated = self.found
         self.value = int(consts[name], 0) if self.found else 0
         self.layout_item = None
+        self._in_unlimited_array = False
+
+    def is_constant(self):
+        return self.found and not self.layout_item
 
     def update_references(self, dependant_layout_item):
         if self.found:
             return
-        self.layout_item = AdbParser.get_layout_item_by_path(self._name, dependant_layout_item)
+        self.layout_item = AdbParser.get_layout_item_by_path(self._name, dependant_layout_item, skip_union_parent=True)
         if self.layout_item:
             self.found = True
+            self._in_unlimited_array = self.layout_item.is_in_unlimited_array()
 
-    def evaluate(self, bit_array):
+    def evaluate(self, bit_array, offset_shift):
         if not self.evaluated:
             if self.found and self.layout_item:
-                offset = calculate_aligned_offset(self.layout_item.offset, self.layout_item.size)
-                self.evaluated = True
+                element_shift = offset_shift if self._in_unlimited_array else 0
+                offset = calculate_aligned_offset(self.layout_item.offset + element_shift, self.layout_item.size)
+                self.evaluated = not self._in_unlimited_array
                 self.value = int(bit_array[offset:offset + self.layout_item.size], 2)
             else:
                 raise ResourceParseException('Condition variable - "{}", was not found in the adb'.format(self._name))
@@ -509,6 +535,10 @@ class ConditionParser:
     symbol_operators = ('~', '|', '==', '!=', '(', ')')
     operators = word_operators + symbol_operators
 
+    variable_pattern = re.compile(r"(?:\$\([a-zA-Z_]\w*\)|\b[a-zA-Z_]\w*)(?:\.[a-zA-Z_]\w*)*")
+    simple_name_pattern = re.compile(r"\b[a-zA-Z_]\w*")
+    whole_word_pattern = r"\b{}\b"
+
     allowed_node_types = (ast.Expression, ast.Name, ast.Load,
                           ast.UnaryOp, ast.unaryop,
                           ast.BinOp, ast.operator,
@@ -518,14 +548,18 @@ class ConditionParser:
     allowed_number_types = (int, float, complex)
 
     def __init__(self, condition_str: str, consts):
-        variable_names = [word for word in re.findall(r"\$\([a-zA-Z_][\w]*\)(?:\.[a-zA-Z_][\w]*)*|[a-zA-Z_][\w]*(?:\.[a-zA-Z_][\w]*)*", condition_str) if word not in ConditionParser.word_operators]
-        self._variables = {re.sub(r"\$\(([a-zA-Z_][\w]*)\)", r"___dollar___\1", variable_name.replace(".", "___")): ConditionVariable(variable_name, consts) for variable_name in variable_names}
+        variable_names = [word for word in ConditionParser.variable_pattern.findall(condition_str) if word not in ConditionParser.word_operators]
+        self._variables = {ConditionParser._to_python_name(variable_name): ConditionVariable(variable_name, consts) for variable_name in variable_names}
         self._condition_str = condition_str
         for adb_op, py_op in ConditionParser.adb_to_py_ops.items():
             self._condition_str = self._condition_str.replace(adb_op, py_op)
         for fixed_variable_name, variable in self._variables.items():
             self._condition_str = self._condition_str.replace(variable._name, fixed_variable_name)
         self._condition_str = self._condition_str.strip()
+
+    @staticmethod
+    def _to_python_name(variable_name):
+        return variable_name.replace("$(", "___dollar___").replace(")", "").replace(".", "___")
 
     @staticmethod
     def _is_allowed_node(node):
@@ -537,15 +571,58 @@ class ConditionParser:
     def update_variables(self, layout_item):
         for variable in self._variables.values():
             variable.update_references(layout_item)
+        replaced_labels = set()
+        for variable_name, variable in self._variables.items():
+            if variable.layout_item and variable.layout_item.adb_enum:
+                replaced_labels.update(self._replace_enum_labels(variable_name, variable.layout_item.adb_enum))
+        for label in replaced_labels:
+            if not self._contains_name(label):
+                del self._variables[label]
 
-    def evaluate(self, bit_array):
+    def _replace_enum_labels(self, enum_variable_name, adb_enum):
+        label_spans = {}
+        enum_variable_pattern = ConditionParser.whole_word_pattern.format(re.escape(enum_variable_name))
+        for occurrence in re.finditer(enum_variable_pattern, self._condition_str):
+            scope_start, scope_end = self._find_enclosing_scope(occurrence.start())
+            for name_match in ConditionParser.simple_name_pattern.finditer(self._condition_str, scope_start, scope_end):
+                if self._is_enum_label(name_match.group(), enum_variable_name, adb_enum):
+                    label_spans[name_match.span()] = name_match.group()
+        for (start, end), label in sorted(label_spans.items(), reverse=True):
+            self._condition_str = self._condition_str[:start] + str(adb_enum.string_to_num[label]) + self._condition_str[end:]
+        return set(label_spans.values())
+
+    def _is_enum_label(self, name, enum_variable_name, adb_enum):
+        variable = self._variables.get(name)
+        return name != enum_variable_name and variable is not None and not variable.is_constant() \
+            and name in adb_enum.string_to_num
+
+    def _find_enclosing_scope(self, position):
+        scope_start = self._find_scope_edge(range(position - 1, -1, -1), ')', '(', -1) + 1
+        scope_end = self._find_scope_edge(range(position, len(self._condition_str)), '(', ')', len(self._condition_str))
+        return scope_start, scope_end
+
+    def _find_scope_edge(self, indices, nesting_char, edge_char, not_found_index):
+        depth = 0
+        for index in indices:
+            if self._condition_str[index] == nesting_char:
+                depth += 1
+            elif self._condition_str[index] == edge_char:
+                if depth == 0:
+                    return index
+                depth -= 1
+        return not_found_index
+
+    def _contains_name(self, name):
+        return re.search(ConditionParser.whole_word_pattern.format(re.escape(name)), self._condition_str) is not None
+
+    def evaluate(self, bit_array, offset_shift):
         try:
             tree = ast.parse(self._condition_str, mode='eval')
         except SyntaxError:
             raise ResourceParseException("Invalid condition syntax")
         if not all(ConditionParser._is_allowed_node(node) for node in ast.walk(tree)):
             raise ResourceParseException("Condition contains unsupported operation")
-        locals = {variable_name: variable.evaluate(bit_array) for variable_name, variable in self._variables.items()}
+        locals = {variable_name: variable.evaluate(bit_array, offset_shift) for variable_name, variable in self._variables.items()}
         return eval(compile(tree, filename='', mode='eval'), None, locals)
 
     def reset(self):
@@ -589,6 +666,14 @@ class AdbLayoutItem(object):
         while layout_item.parent:
             layout_item = layout_item.parent
         return layout_item
+
+    def is_in_unlimited_array(self):
+        layout_item = self
+        while layout_item:
+            if layout_item.is_unlimited_array:
+                return True
+            layout_item = layout_item.parent
+        return False
 
 
 ####################################################################
